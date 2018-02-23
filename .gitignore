@@ -1,2 +1,6 @@
 /corpus
 /.ipynb_checkpoints
+utils.py
+archive
+assets
+/__pycache__

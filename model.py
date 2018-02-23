@@ -1,0 +1,56 @@
+import torch
+import torch.nn.functional as F
+import torch.nn as nn
+
+
+class Word2CNN(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, kernel_dims, kernel_sizes,
+                 highway_layers=2):
+        super(Word2CNN, self).__init__()
+        self.embeddings = nn.Embedding(vocab_size, embedding_dim)
+        self.convs = nn.ModuleList([
+            nn.Conv2d(1, dim, (size, embedding_dim), padding=(size-1, 0))
+            for dim, size in zip(kernel_dims, kernel_sizes)])
+        self.internal_dim = sum(kernel_dims)
+        self.hw_num_layers = highway_layers
+        self.hw_nonlinear = nn.ModuleList([
+            nn.Linear(self.internal_dim, self.internal_dim)
+            for _ in range(highway_layers)])
+        self.hw_linear = nn.ModuleList([
+            nn.Linear(self.internal_dim, self.internal_dim)
+            for _ in range(highway_layers)])
+        self.hw_gate = nn.ModuleList([
+            nn.Linear(self.internal_dim, self.internal_dim)
+            for _ in range(highway_layers)])
+        self.final_layer = nn.Linear(self.internal_dim * 2, 2)
+        self.logsigmoid = nn.LogSigmoid()
+
+    def char_cnn(self, inputs):
+        # [BATCH, 1, MAX_LENGTH, EM_SIZE]
+        inputs = self.embeddings(inputs).unsqueeze(1)
+        # [BATCH, K_DIM, MAX_LENGTH]*len(Ks)
+        inputs = [F.tanh(conv(inputs)).squeeze(3) for conv in self.convs]
+        # [BATCH, K_DIM]*len(Ks)
+        inputs = [F.max_pool1d(i, i.size(2)).squeeze(2) for i in inputs]
+        # [BATCH, K_DIM*len(Ks)]
+        inputs = torch.cat(inputs, 1)
+        for layer in range(self.hw_num_layers):
+            gate = F.sigmoid(self.hw_gate[layer](inputs))
+            nonlinear = F.relu(self.hw_nonlinear[layer](inputs))
+            linear = self.hw_linear[layer](inputs)
+            inputs = gate * nonlinear + (1 - gate) * linear
+        return inputs
+
+    def forward(self, sequences, num_negs):
+        embeddings = self.char_cnn(sequences)
+        embeddings = embeddings.view(-1, num_negs + 2, embeddings.size()[-1])
+        center_embeds = embeddings[:, 0, :].unsqueeze(1)
+        target_embeds = embeddings[:, 1, :].unsqueeze(1)
+        negati_embeds = -1*embeddings[:, 2:, :]
+        p_scre = target_embeds.bmm(center_embeds.transpose(1, 2))
+        n_scre = torch.sum(negati_embeds.bmm(center_embeds.transpose(1, 2)), 1)
+        loss = self.logsigmoid(p_scre) + self.logsigmoid(n_scre)
+        return -torch.mean(loss)
+
+    def prediction(self, inputs):
+        return self.char_cnn(inputs)
