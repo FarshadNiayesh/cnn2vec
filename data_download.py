@@ -6,10 +6,10 @@ from utils import API_KEY
 
 
 headers = {'Authorization': API_KEY}
-base_0 = 'http://188.166.23.190/api/company_list'
-base_1 = 'http://188.166.23.190/api/document_list'
-base_2 = 'http://188.166.23.190/api/document'
-base_3 = 'http://188.166.23.190/api/documents'
+base_0 = 'http://maximedb.com/api/company_list'
+base_1 = 'http://maximedb.com/api/document_list'
+base_2 = 'http://maximedb.com/api/document'
+base_3 = 'http://maximedb.com/api/documents'
 text_location = os.path.join(os.getcwd(), 'corpus')
 print('Downloading documents to {}'.format(text_location))
 

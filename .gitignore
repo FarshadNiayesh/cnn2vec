@@ -4,3 +4,4 @@ utils.py
 archive
 assets
 /__pycache__
+runs/
