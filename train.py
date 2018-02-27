@@ -1,6 +1,6 @@
 from model import Word2CNN
 from data_preperation import build_utilities, SingleFileDataset, build_vocabs
-from data_preperation import DataLoaderMultiFiles
+from data_preperation import DataLoaderMultiFiles, build_dataset, build_vocab_multi
 import torch
 from torch.autograd import Variable
 from functools import partial
@@ -9,16 +9,16 @@ import numpy as np
 import pickle
 import argparse
 import os
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import StepLR, MultiStepLR
 from tensorboardX import SummaryWriter
-from yellowfin import YFOptimizer
+import klepto
 
 USE_CUDA = torch.cuda.is_available()
 gpus = [0]
 torch.cuda.set_device(gpus[0])
 FloatTensor = torch.cuda.FloatTensor if USE_CUDA else torch.FloatTensor
 LongTensor = torch.cuda.LongTensor if USE_CUDA else torch.LongTensor
-writer = SummaryWriter()
+# writer = SummaryWriter()
 
 
 def save_obj(obj, name):
@@ -49,8 +49,10 @@ def main(args):
         char_vocab = load_obj(args.char_path)
     else:
         cwd = os.getcwd()
-        corpus = os.path.join(cwd, args.corpus_dir)
-        word_vocab, char_vocab = build_vocabs(corpus, args.min_cnt)
+        corpus = args.corpus_dir
+        files = [os.path.join(cwd, corpus, e) for e in os.listdir(corpus)]
+        files = files[:args.max_files]
+        word_vocab, char_vocab = build_vocab_multi(files, args.min_count, 4)
         save_obj(word_vocab, 'assets/word_vocab.pkl')
         save_obj(char_vocab, 'assets/char_vocab.pkl')
 
@@ -60,18 +62,20 @@ def main(args):
     unigram_table = tmp['unigram_table']
     num_total_words = tmp['num_total_words']
     word_vocab = tmp['word_vocab']
-
-    # Dataset construction
-    cwd = os.getcwd()
-    corpus = args.corpus_dir
-    files = [os.path.join(cwd, corpus, e) for e in os.listdir(corpus)]
-    files = files[:args.max_files]
-    partialfn = partial(SingleFileDataset, word_vocab=word_vocab,
-                        char_to_index=char_to_index, min_count=args.min_count,
-                        window=args.window, unigram_table=unigram_table,
-                        num_total_words=num_total_words,
-                        neg_samples=args.num_negs)
     vocab_size = len(char_to_index)
+
+    if args.dataset is not None:
+        dataset = load_obj(args.dataset)
+    else:
+        cwd = os.getcwd()
+        corpus = args.corpus_dir
+        files = [os.path.join(cwd, corpus, e) for e in os.listdir(corpus)]
+        files = files[:args.max_files]
+        archive = klepto.archives.dir_archive('archive', cached=False)
+        dataset = build_dataset(files, 4, word_vocab, char_vocab,
+                                args.min_count, args.window, unigram_table,
+                                num_total_words, args.num_negs, archive)
+        save_obj(dataset, 'assets/dataset.pkl')
 
     # Model intialization
     model = Word2CNN(vocab_size, args.char_embed, args.kernel_numbers,
@@ -80,15 +84,13 @@ def main(args):
 
     lr = args.lr
     if args.optim == "sgd":
-        optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9)
-        scheduler = StepLR(optimizer, step_size=1, gamma=0.5)
+        optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0)
+        scheduler = MultiStepLR(optimizer, milestones=[1e3, 1e4, 1e5, 1e6],
+                                gamma=0.5)
     elif args.optim == "adam":
-        optimizer = optim.Adam(model.parameters(), lr=lr, amsgrad=True,
-                               eps=0.1)
+        optimizer = optim.Adam(model.parameters(), lr=lr, amsgrad=True)
     elif args.optim == "rms":
         optimizer = optim.RMSprop(model.parameters(), lr=lr)
-    elif args.optim == "yf":
-        optimizer = YFOptimizer(model.parameters())
 
     if args.resume:
         checkpoint = torch.load(args.archive_path)
@@ -102,22 +104,23 @@ def main(args):
         lr = args.lr
         min_loss = np.inf
 
-    dl = DataLoaderMultiFiles(files, partialfn, args.batch, args.buffer_size)
+    dl = DataLoaderMultiFiles(dataset, args.batch)
     for epoch in range(current_epoch, args.epochs):
         losses = []
         mean_losses = [np.inf]
-        if args.optim == "sgd":
-            scheduler.step()
         for i, batch in enumerate(dl):
+            if args.optim == "sgd":
+                scheduler.step()
             inputs = Variable(batch, requires_grad=False)
             loss = model(inputs, args.num_negs)
             loss.backward()
             optimizer.step()
             model.zero_grad()
-            losses.append(loss.data.tolist()[0])
+            loss = loss.data.tolist()[0]
+            losses.append(loss)
             if i % args.report == 0:
                 mean_l = np.mean(losses[-args.report:])
-                writer.add_scalar('data/interim_loss', mean_l, (epoch+1)*i)
+                # writer.add_scalar('data/interim_loss', mean_l, (epoch+1)*i)
                 if mean_l < np.min(mean_losses):
                     save_checkpoint({'epoch': epoch,
                                      'state_dict': model.state_dict(),
@@ -130,7 +133,7 @@ def main(args):
                 mean_losses.append(mean_l)
         epoch_loss = np.mean(losses)
         print('Epoch loss: {}'.format(epoch_loss))
-        writer.add_scalar('data/epoch_loss', epoch_loss, epoch)
+        # writer.add_scalar('data/epoch_loss', epoch_loss, epoch)
         if epoch_loss < min_loss:
             min_loss = epoch_loss
         save_checkpoint({'epoch': epoch,
@@ -142,16 +145,15 @@ def main(args):
                          'learning_rate': lr,
                          'args': args})
 
-    writer.close()
 
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--word_path', help='Word counter relative filepath',
-                        default="assets/word_vocab.pkl")
+                        default=None) #  assets/word_vocab.pkl
     parser.add_argument('--char_path', help='Characters counter filepath',
-                        default="assets/char_vocab.pkl")
+                        default=None) #  "assets/char_vocab.pkl"
     parser.add_argument('--ds_path', help='DataSet Path', default=None)
     parser.add_argument('--batch', help='Batch size', type=int, default=1024)
     parser.add_argument('--window', help='Skip-gram window', default=5,
@@ -178,7 +180,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_workers', help='Number of DataLoader workers',
                         type=int, default=0)
     parser.add_argument('--buffer_size', help='Data buffer size',
-                        type=int, default=1000000)
+                        type=int, default=750000)
     parser.add_argument('--vocab_size', help='Char vocab size',
                         type=int, default=125)
     parser.add_argument('--optim', help='Optimizer (sgd, adam)', default='sgd')
@@ -189,5 +191,7 @@ if __name__ == "__main__":
     parser.add_argument('--archive_path', help="Path where to find the model")
     parser.add_argument('--batch_norm', help="Use batchnorm (default False)",
                         action='store_true')
+    parser.add_argument('--dataset', help="Path to the pickled datasets",
+                        default=None)
     args = parser.parse_args()
     main(args)

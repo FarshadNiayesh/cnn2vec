@@ -1,19 +1,18 @@
 import torch
-from torch.utils.data import Dataset
 import numpy as np
 from nltk import word_tokenize
 from nltk.tokenize import ToktokTokenizer
 import math
 import random
 import os
-from collections import Counter, deque
-import torch.multiprocessing as multiprocessing
+from collections import Counter
+import torch.multiprocessing
 from torch.multiprocessing import Process
 from torch.multiprocessing import Queue
 from threading import Thread
 from queue import Empty
 from datetime import datetime
-from functools import partial
+from collections import deque
 
 USE_CUDA = torch.cuda.is_available()
 gpus = [0]
@@ -22,11 +21,11 @@ FloatTensor = torch.cuda.FloatTensor if USE_CUDA else torch.FloatTensor
 LongTensor = torch.cuda.LongTensor if USE_CUDA else torch.LongTensor
 
 
-class SingleFileDataset(Dataset):
+class SingleFileDataset(object):
     """Dataset to prepare a single file of Skip-Gram entries"""
 
     def __init__(self, path, word_vocab, char_to_index, min_count, window,
-                 unigram_table, num_total_words, archive, neg_samples=5):
+                 unigram_table, num_total_words, neg_samples=5):
         self.min_count = min_count
         self.path = path
         self.w_vocab = word_vocab
@@ -36,24 +35,15 @@ class SingleFileDataset(Dataset):
         self.window = window
         self.table = unigram_table
         self.neg_samples = neg_samples
-        self.id = os.path.basename(path).split('.')[0]
-        self.archive = archive
-        tmp = []
-        for i, (word, target) in enumerate(self.prepare_file(self.path)):
-            tmp.append((word, target))
-        self.archive[self.id] = tmp
 
-    def __getitem__(self, idx):
-        word, target = self.archive[self.id][idx]
-        negs = self.get_negatives(word)
-        negs = [self.prepare_tensor(neg) for neg in negs]
-        example = [self.prepare_tensor(word), self.prepare_tensor(target)]
-        example += negs
-        return example
-
-    def __len__(self):
-        print('Length: {}'.format(len(self.archive[self.id])))
-        return len(self.archive[self.id])
+    def next(self):
+        """Get an item from the examples and add negative samples"""
+        for word, target in self.prepare_file(self.path):
+            negs = self.get_negatives(word)
+            negs = [self.prepare_tensor(neg) for neg in negs]
+            example = [self.prepare_tensor(word), self.prepare_tensor(target)]
+            example += negs
+            yield example
 
     def prepare_tensor(self, word):
         return prepare_tensor(word, self.c_to_index)
@@ -97,62 +87,120 @@ class SingleFileDataset(Dataset):
 class DataLoaderMultiFiles(object):
     """DataLoader to iterator over a set of DataSet"""
 
-    def __init__(self, dataset, batch_s):
-        self.dataset = dataset
+    def __init__(self, filepaths, partial, batch_s, buffer_s):
+        self.filepaths = filepaths
+        self.partial = partial
         self.batch_size = batch_s
-        self.index_queue = deque(torch.randperm(len(self.dataset)).tolist())
+        self.max_len = buffer_s
+        self.buffer = Queue(maxsize=buffer_s)
         self.batch_queue = Queue(maxsize=10)
 
     def __iter__(self):
-        print('here')
-        args = (self.batch_queue, self.index_queue, self.dataset,
-                self.batch_size)
+        print('Starting processes')
+        random.seed(0)
+        random.shuffle(self.filepaths)
+        filepaths = deque()
+        for path in self.filepaths:
+            filepaths.append(path)
+        self.buffr_processes = []
+        args = (self.filepaths, self.buffer, self.partial)
+        for i in range(10):
+            process = Process(target=fill_buffer, args=args)
+            process.daemon = True
+            process.start()
+            self.buffr_processes.append(process)
+
+        args = (self.buffer, self.batch_queue, self.batch_size)
         self.batch_process = Process(target=fill_batch, args=args)
         self.batch_process.daemon = True
         self.batch_process.start()
         return self
 
     def done_files(self):
-        # return sum([e.is_alive() for e in self.buffr_processes])
-        return not self.batch_process.is_alive()
+        return sum([e.is_alive() for e in self.buffr_processes])
 
     def __next__(self):
-        print('get batch')
-        print('batch_queue: {}'.format(self.batch_queue.qsize()))
-        timeout = 1 if self.done_files() == 0 else 600
+        # print('get batch')
+        # print('buffer_queue: {}, batch_queue: {}'.format(self.buffer.qsize(), self.batch_queue.qsize())) # noqa
+        timeout = 1 if self.done_files() == 0 else 60
         try:
             batch = self.batch_queue.get(timeout=timeout)
         except Empty:
-            print('empty')
             self.kill()
             raise StopIteration
-        print('got batch')
+        # print('got batch')
         tmp = LongTensor(batch)
-        print('computing')
+        # print('computing')
         return tmp
 
     def kill(self):
         print('Killing processes')
+        self.buffr_process.terminate()
         self.batch_process.terminate()
 
     def __del__(self):
         self.kill()
 
 
-def fill_batch(batch_queue, index_queue, dataset, batch_size):
-    batch = []
-    counter = 0
-    print('filling batch')
-    while len(index_queue) > 0:
-        index = index_queue.pop()
-        example = dataset[index]
-        batch.extend(example)
-        counter += 1
-        print('here')
-        if counter == batch_size:
-            print('at batcvh size')
-            counter = 0
-            batch_queue.put(pad_sequences(batch))
+def fill_buffer(filepaths, buffr, partial):
+    while len(filepaths) > 0:
+        path = filepaths.pop()
+        ds = partial(path)
+        for element in ds.next():
+            buffr.put(element)
+    # random.shuffle(filepaths)
+    # start_time = datetime.now()
+    # ln = len(filepaths)
+    # for i, path in enumerate(filepaths):
+    #     if (i % 100 == 0) and (i > 0):
+    #         diff = (datetime.now() - start_time).seconds
+    #         if diff == 0:
+    #             continue
+    #         time_per_doc = i/diff
+    #         time_left = (ln - i)*time_per_doc/3600
+    #         print('{:.2f} hours until new epoch'.format(time_left))
+    #     ds = partial(path)
+    #     for element in ds.next():
+    #         buffr.put(element)
+    # print('End of datasets')
+    # buffr.put('DONE')
+
+
+def max_size(elements):
+    max_size = 0
+    for elem in elements:
+        if len(elem) > max_size:
+            max_size = len(elem)
+    return max_size
+
+
+def fill_batch(buffr, batch, batch_size):
+    pid = torch.multiprocessing.current_process()._identity[0]
+    print('Seed of {}'.format(pid+1))
+    go_on = True
+    while go_on:
+        # print('New batch, queue size: {}'.format(buffr.qsize()))
+        # deque the batch
+        if buffr.qsize() == 0:
+            print('Empty queue!')
+            go_on = False
+            continue
+        internal_buffer = []
+        for i in range(buffr.qsize()):
+            tmp = buffr.get()
+            if tmp == 'DONE':
+                go_on = False
+                break
+            internal_buffer.append(tmp)
+        # internal_buffer = sorted(internal_buffer, key=max_size)
+        random.shuffle(internal_buffer)
+        for i in range(0, len(internal_buffer), batch_size):
+            elements = internal_buffer[i:i+batch_size]
+            current_batch = []
+            for ele in elements:
+                current_batch.extend(ele)
+            batch.put(pad_sequences(current_batch))
+    batch.put('DONE')
 
 
 def pad_sequences(sequences):
@@ -175,39 +223,30 @@ def prepare_tensor(word, char_to_index):
     return np.array(indices)
 
 
-def build_vocab_multi(directory_path, min_count, num_workers):
-    func = partial(build_vocabs, min_count=min_count)
-    p = multiprocessing.Pool(num_workers)
-    word_counter = Counter()
-    char_counter = Counter()
-    char_counter.update(['{', '}'])
-    counter = 0
-    for x, y in p.imap(func, directory_path):
-        counter += 1
-        print(counter)
-        word_counter += x
-        char_counter += y
-    return word_counter, char_counter
-
-
-def build_vocabs(filepath, min_count):
+def build_vocabs(directory_path, min_count):
     """Build the word and char counter vocabularies"""
     toktok = ToktokTokenizer()
     word_vocab = Counter()
     char_vocab = Counter()
-    with open(filepath, 'r', encoding='utf8') as f:
-        try:
-            line = f.read()
-            if 'numbers_' in filepath:
-                tmp = toktok.tokenize(line.lower())
-                for i in range(min_count):
-                    word_vocab.update(tmp)
-            else:
-                word_vocab.update(word_tokenize(line.lower()))
-            char_vocab.update(line)
-        except Exception as error:
-            print('Error with file: {}'.format(filepath))
-            print(error)
+    char_vocab.update(['{', '}'])
+    filenames = os.listdir(directory_path)
+    filepaths = [os.path.join(directory_path, e) for e in filenames]
+    for i, filepath in enumerate(filepaths):
+        if i % 100 == 0:
+            print('Reading file number {}'.format(i), end="\r")
+        with open(filepath, 'r', encoding='utf8') as f:
+            try:
+                line = f.read()
+                if 'numbers_' in filepath:
+                    tmp = toktok.tokenize(line.lower())
+                    for i in range(min_count):
+                        word_vocab.update(tmp)
+                else:
+                    word_vocab.update(word_tokenize(line.lower()))
+                char_vocab.update(line)
+            except Exception as error:
+                print('Error with file: {}'.format(filepath))
+                print(error)
     return word_vocab, char_vocab
 
 
@@ -229,18 +268,3 @@ def build_utilities(word_vocab, char_vocab, vocab_size, min_cnt):
     return dict(char_to_index=char_to_index, index_to_char=index_to_char,
                 unigram_table=unigram_table, num_total_words=num_total_words,
                 word_vocab=word_vocab)
-
-
-def build_dataset(paths, num_workers, word_vocab, char_to_index, min_count,
-                  window, unigram_table, num_total_words, neg_samples,
-                  archive):
-    func = partial(SingleFileDataset, word_vocab=word_vocab, window=window,
-                   char_to_index=char_to_index, min_count=min_count,
-                   unigram_table=unigram_table, neg_samples=neg_samples,
-                   num_total_words=num_total_words, archive=archive)
-    p = multiprocessing.Pool(4)
-    datasets = []
-    for x in p.imap(func, paths):
-        print('here')
-        datasets.append(x)
-    return torch.utils.data.ConcatDataset(datasets)
