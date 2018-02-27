@@ -1,24 +1,23 @@
 from model import Word2CNN
-from data_preperation import build_utilities, SingleFileDataset, build_vocabs
-from data_preperation import DataLoaderMultiFiles, build_dataset, build_vocab_multi
+from data_preperation import build_utilities, SingleFileDataset
+from data_preperation import DataLoaderMultiFiles, build_dataset
+from data_preperation import build_vocab_multi
 import torch
 from torch.autograd import Variable
-from functools import partial
 import torch.optim as optim
 import numpy as np
 import pickle
 import argparse
 import os
-from torch.optim.lr_scheduler import StepLR, MultiStepLR
+from torch.optim.lr_scheduler import MultiStepLR
 from tensorboardX import SummaryWriter
-import klepto
+from torch.utils.data import ConcatDataset
 
 USE_CUDA = torch.cuda.is_available()
 gpus = [0]
 torch.cuda.set_device(gpus[0])
 FloatTensor = torch.cuda.FloatTensor if USE_CUDA else torch.FloatTensor
 LongTensor = torch.cuda.LongTensor if USE_CUDA else torch.LongTensor
-# writer = SummaryWriter()
 
 
 def save_obj(obj, name):
@@ -71,10 +70,15 @@ def main(args):
         corpus = args.corpus_dir
         files = [os.path.join(cwd, corpus, e) for e in os.listdir(corpus)]
         files = files[:args.max_files]
-        archive = klepto.archives.dir_archive('archive', cached=False)
-        dataset = build_dataset(files, 4, word_vocab, char_vocab,
-                                args.min_count, args.window, unigram_table,
-                                num_total_words, args.num_negs, archive)
+        files = build_dataset(files, args.num_workers, word_vocab,
+                              args.min_count, args.window, num_total_words,
+                              'assets/datasets/{}.tsv')
+        ds_list = []
+        for ds_file in files:
+            ds = SingleFileDataset(ds_file, char_to_index,
+                                   unigram_table, args.num_negs)
+            ds_list.append(ds)
+        dataset = ConcatDataset(ds_list)
         save_obj(dataset, 'assets/dataset.pkl')
 
     # Model intialization
@@ -105,6 +109,8 @@ def main(args):
         min_loss = np.inf
 
     dl = DataLoaderMultiFiles(dataset, args.batch)
+    writer = SummaryWriter()
+    print('Starting training')
     for epoch in range(current_epoch, args.epochs):
         losses = []
         mean_losses = [np.inf]
@@ -120,7 +126,7 @@ def main(args):
             losses.append(loss)
             if i % args.report == 0:
                 mean_l = np.mean(losses[-args.report:])
-                # writer.add_scalar('data/interim_loss', mean_l, (epoch+1)*i)
+                writer.add_scalar('data/interim_loss', mean_l, (epoch+1)*i)
                 if mean_l < np.min(mean_losses):
                     save_checkpoint({'epoch': epoch,
                                      'state_dict': model.state_dict(),
@@ -146,14 +152,13 @@ def main(args):
                          'args': args})
 
 
-
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--word_path', help='Word counter relative filepath',
-                        default=None) #  assets/word_vocab.pkl
+                        default="assets/word_vocab.pkl")
     parser.add_argument('--char_path', help='Characters counter filepath',
-                        default=None) #  "assets/char_vocab.pkl"
+                        default="assets/char_vocab.pkl")
     parser.add_argument('--ds_path', help='DataSet Path', default=None)
     parser.add_argument('--batch', help='Batch size', type=int, default=1024)
     parser.add_argument('--window', help='Skip-gram window', default=5,
@@ -183,7 +188,8 @@ if __name__ == "__main__":
                         type=int, default=750000)
     parser.add_argument('--vocab_size', help='Char vocab size',
                         type=int, default=125)
-    parser.add_argument('--optim', help='Optimizer (sgd, adam)', default='sgd')
+    parser.add_argument('--optim', help='Optimizer (sgd, adam)',
+                        default='adam')
     parser.add_argument('--report', help='Report stats every X batch.',
                         default=100, type=int)
     parser.add_argument('--resume', help="Resume training",

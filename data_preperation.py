@@ -1,7 +1,7 @@
 import torch
 from torch.utils.data import Dataset
 import numpy as np
-from nltk import word_tokenize
+from nltk import word_tokenize, sent_tokenize
 from nltk.tokenize import ToktokTokenizer
 import math
 import random
@@ -14,6 +14,9 @@ from threading import Thread
 from queue import Empty
 from datetime import datetime
 from functools import partial
+import signal
+import string
+import linecache
 
 USE_CUDA = torch.cuda.is_available()
 gpus = [0]
@@ -25,35 +28,34 @@ LongTensor = torch.cuda.LongTensor if USE_CUDA else torch.LongTensor
 class SingleFileDataset(Dataset):
     """Dataset to prepare a single file of Skip-Gram entries"""
 
-    def __init__(self, path, word_vocab, char_to_index, min_count, window,
-                 unigram_table, num_total_words, archive, neg_samples=5):
-        self.min_count = min_count
+    def __init__(self, path, char_to_index, unigram_table, neg_samples=5):
         self.path = path
-        self.w_vocab = word_vocab
         self.c_to_index = char_to_index
-        self.unk = char_to_index['UNK']
-        self.total_w = num_total_words
-        self.window = window
         self.table = unigram_table
         self.neg_samples = neg_samples
-        self.id = os.path.basename(path).split('.')[0]
-        self.archive = archive
-        tmp = []
-        for i, (word, target) in enumerate(self.prepare_file(self.path)):
-            tmp.append((word, target))
-        self.archive[self.id] = tmp
+        self.len = self.file_len(path)
 
     def __getitem__(self, idx):
-        word, target = self.archive[self.id][idx]
+        try:
+            line = linecache.getline(self.path, idx + 1)
+            word, target = line.split('\t')
+        except Exception:
+            print('Error at line {}'.format(idx))
+            print(line)
         negs = self.get_negatives(word)
         negs = [self.prepare_tensor(neg) for neg in negs]
         example = [self.prepare_tensor(word), self.prepare_tensor(target)]
         example += negs
         return example
 
+    def file_len(self, fname):
+        with open(fname, 'r', encoding='utf-8') as f:
+            for i, l in enumerate(f):
+                pass
+        return i - 1
+
     def __len__(self):
-        print('Length: {}'.format(len(self.archive[self.id])))
-        return len(self.archive[self.id])
+        return self.len - 1
 
     def prepare_tensor(self, word):
         return prepare_tensor(word, self.c_to_index)
@@ -67,32 +69,6 @@ class SingleFileDataset(Dataset):
             to_return.append(neg)
         return to_return
 
-    def prepare_file(self, filepath):
-        with open(filepath, 'r', encoding='utf8') as f:
-            for line in f:
-                for word, target in self.prepare_line(line):
-                    yield word, target
-
-    def prepare_line(self, line):
-        words = word_tokenize(line)
-        max_j = len(words)
-        for i, word in enumerate(words):
-            if word.lower() not in self.w_vocab:
-                continue
-            if self.w_vocab[word.lower()] < self.min_count:
-                continue
-            frequency = self.w_vocab[word.lower()] / self.total_w
-            number = 1 - math.sqrt(10e-5/frequency)
-            if random.uniform(0, 1) <= number:
-                continue
-            for j in range(i - self.window, i + self.window):
-                if (i == j) or (j < 0) or (j >= max_j):
-                    continue
-                target = words[j]
-                if target.lower() not in self.w_vocab:
-                    continue
-                yield word, target
-
 
 class DataLoaderMultiFiles(object):
     """DataLoader to iterator over a set of DataSet"""
@@ -101,10 +77,10 @@ class DataLoaderMultiFiles(object):
         self.dataset = dataset
         self.batch_size = batch_s
         self.index_queue = deque(torch.randperm(len(self.dataset)).tolist())
-        self.batch_queue = Queue(maxsize=10)
+        self.batch_queue = Queue(maxsize=5)
 
     def __iter__(self):
-        print('here')
+        print('new iteration of dataloader')
         args = (self.batch_queue, self.index_queue, self.dataset,
                 self.batch_size)
         self.batch_process = Process(target=fill_batch, args=args)
@@ -112,23 +88,22 @@ class DataLoaderMultiFiles(object):
         self.batch_process.start()
         return self
 
-    def done_files(self):
+    def is_alive(self):
         # return sum([e.is_alive() for e in self.buffr_processes])
-        return not self.batch_process.is_alive()
+        return self.batch_process.is_alive()
 
     def __next__(self):
-        print('get batch')
-        print('batch_queue: {}'.format(self.batch_queue.qsize()))
-        timeout = 1 if self.done_files() == 0 else 600
+        # print('batch_queue: {}'.format(self.batch_queue.qsize()))
+        timeout = 600 if self.is_alive() else 1
         try:
             batch = self.batch_queue.get(timeout=timeout)
         except Empty:
             print('empty')
             self.kill()
             raise StopIteration
-        print('got batch')
+        # print('got batch')
         tmp = LongTensor(batch)
-        print('computing')
+        # print('computing')
         return tmp
 
     def kill(self):
@@ -148,11 +123,11 @@ def fill_batch(batch_queue, index_queue, dataset, batch_size):
         example = dataset[index]
         batch.extend(example)
         counter += 1
-        print('here')
         if counter == batch_size:
-            print('at batcvh size')
             counter = 0
             batch_queue.put(pad_sequences(batch))
+            batch = []
+    print('dataset done')
 
 
 def pad_sequences(sequences):
@@ -231,16 +206,68 @@ def build_utilities(word_vocab, char_vocab, vocab_size, min_cnt):
                 word_vocab=word_vocab)
 
 
-def build_dataset(paths, num_workers, word_vocab, char_to_index, min_count,
-                  window, unigram_table, num_total_words, neg_samples,
-                  archive):
-    func = partial(SingleFileDataset, word_vocab=word_vocab, window=window,
-                   char_to_index=char_to_index, min_count=min_count,
-                   unigram_table=unigram_table, neg_samples=neg_samples,
-                   num_total_words=num_total_words, archive=archive)
-    p = multiprocessing.Pool(4)
-    datasets = []
+def file_to_features(path, word_vocab, window, min_count, total_w):
+    examples = []
+    toktok = ToktokTokenizer()
+    punckt = set(string.punctuation)
+    with open(path, 'r', encoding='utf8') as f:
+        for line in f:
+            for sentence in sent_tokenize(line):
+                words_1 = toktok.tokenize(sentence)
+                words_2 = []
+                for i, word in enumerate(words_1):
+                    word_l = word.lower()
+                    if word_l not in word_vocab:
+                        continue
+                    if word_vocab[word_l] < min_count:
+                        continue
+                    if word in punckt:
+                        continue
+                    frequency = word_vocab[word_l] / total_w
+                    number = 1 - math.sqrt(10e-5/frequency)
+                    if random.uniform(0, 1) <= number:
+                        continue
+                    words_2.append(word)
+                max_j = len(words_2)
+                for i, word in enumerate(words_2):
+                    start = i - window if (i - window) > 0 else 0
+                    to = i + window if (i + window) < max_j else max_j
+                    for j in range(start, to):
+                        if i == j:
+                            continue
+                        target = words_2[j]
+                        examples.append((word, target))
+    return examples
+
+
+def init_worker():
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def build_dataset(paths, num_workers, word_vocab, min_count,
+                  window, num_total_words, archive):
+    func = partial(file_to_features, word_vocab=word_vocab, window=window,
+                   min_count=min_count, total_w=num_total_words)
+    p = multiprocessing.Pool(num_workers, init_worker)
+    files = []
+    file_counter = 0
+    filename = archive.format(file_counter)
+    files.append(filename)
+    archive_f = open(archive.format(file_counter), 'w', encoding='utf-8')
+    archive_f.write('Source\tTarget\n')
+    counter = 0
     for x in p.imap(func, paths):
-        print('here')
-        datasets.append(x)
-    return torch.utils.data.ConcatDataset(datasets)
+        if counter % 100 == 0:
+            print(counter)
+        counter += 1
+        for word, target in x:
+            archive_f.write('{}\t{}\n'.format(word, target))
+        if archive_f.tell() > 5e+8:
+            print('Changing file. Counter at {}'.format(counter))
+            file_counter += 1
+            filename = archive.format(file_counter)
+            files.append(filename)
+            archive_f = open(archive.format(file_counter), 'w',
+                             encoding='utf-8')
+    archive_f.close()
+    return files
