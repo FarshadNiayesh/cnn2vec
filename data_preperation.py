@@ -210,33 +210,36 @@ def file_to_features(path, word_vocab, window, min_count, total_w):
     examples = []
     toktok = ToktokTokenizer()
     punckt = set(string.punctuation)
-    with open(path, 'r', encoding='utf8') as f:
-        for line in f:
-            for sentence in sent_tokenize(line):
-                words_1 = toktok.tokenize(sentence)
-                words_2 = []
-                for i, word in enumerate(words_1):
-                    word_l = word.lower()
-                    if word_l not in word_vocab:
-                        continue
-                    if word_vocab[word_l] < min_count:
-                        continue
-                    if word in punckt:
-                        continue
-                    frequency = word_vocab[word_l] / total_w
-                    number = 1 - math.sqrt(10e-5/frequency)
-                    if random.uniform(0, 1) <= number:
-                        continue
-                    words_2.append(word)
-                max_j = len(words_2)
-                for i, word in enumerate(words_2):
-                    start = i - window if (i - window) > 0 else 0
-                    to = i + window if (i + window) < max_j else max_j
-                    for j in range(start, to):
-                        if i == j:
+    try:
+        with open(path, 'r', encoding='utf8') as f:
+            for line in f:
+                for sentence in sent_tokenize(line):
+                    words_1 = toktok.tokenize(sentence)
+                    words_2 = []
+                    for i, word in enumerate(words_1):
+                        word_l = word.lower()
+                        if word_l not in word_vocab:
                             continue
-                        target = words_2[j]
-                        examples.append((word, target))
+                        if word_vocab[word_l] < min_count:
+                            continue
+                        if word in punckt:
+                            continue
+                        frequency = word_vocab[word_l] / total_w
+                        number = 1 - math.sqrt(10e-5/frequency)
+                        if random.uniform(0, 1) <= number:
+                            continue
+                        words_2.append(word)
+                    max_j = len(words_2)
+                    for i, word in enumerate(words_2):
+                        start = i - window if (i - window) > 0 else 0
+                        to = i + window if (i + window) < max_j else max_j
+                        for j in range(start, to):
+                            if i == j:
+                                continue
+                            target = words_2[j]
+                            examples.append((word, target))
+    except Exception as error:
+        print(error)
     return examples
 
 
